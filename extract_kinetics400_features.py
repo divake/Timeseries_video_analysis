@@ -12,6 +12,7 @@ from transformers import AutoImageProcessor, AutoModelForVideoClassification
 import torchvision.transforms as T
 from PIL import Image
 import cv2  # Add OpenCV for video processing fallback
+import scipy.stats  # For entropy calculation
 
 # Add the current directory to the path to import from existing scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +23,7 @@ from balanced_dataset_eval import get_balanced_video_files
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Extract features from Kinetics-400 videos using VideoMAE')
-    parser.add_argument('--output_dir', type=str, default='kinetics400_features',
+    parser.add_argument('--output_dir', type=str, default='/ssd_4TB/divake/vivit_kinetics400/kinetics400_features_extended',
                         help='Directory to save extracted features')
     parser.add_argument('--samples_per_class', type=int, default=10,
                         help='Number of samples per class for balanced sampling (-1 for all)')
@@ -44,11 +45,74 @@ def parse_args():
                         help='Path to save the downloaded model')
     parser.add_argument('--kinetics_dir', type=str, default='/ssd_4TB/divake/vivit_kinetics400/k400',
                         help='Base directory for Kinetics-400 dataset')
+    parser.add_argument('--annotations_dir', type=str, default=None,
+                        help='Directory containing cleaned annotation files (optional)')
+    parser.add_argument('--extract_attention', action='store_true',
+                        help='Extract attention maps from the model')
     return parser.parse_args()
 
-def process_video(video_path, model, processor, device, num_frames=16):
-    """Process a single video and extract features."""
+def calculate_confidence_metrics(logits):
+    """Calculate confidence metrics from logits."""
+    # Convert logits to probabilities
+    probabilities = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
+    
+    # Get top probabilities and indices
+    sorted_probs = np.sort(probabilities)[::-1]
+    top1_prob = sorted_probs[0]
+    top2_prob = sorted_probs[1] if len(sorted_probs) > 1 else 0
+    
+    # Calculate margin between top-1 and top-2
+    margin = top1_prob - top2_prob
+    
+    # Calculate entropy of the probability distribution
+    entropy = scipy.stats.entropy(probabilities)
+    
+    return {
+        'max_prob': float(top1_prob),
+        'margin': float(margin),
+        'entropy': float(entropy)
+    }
+
+def get_video_metadata(video_path):
+    """Extract metadata from a video file."""
+    metadata = {
+        'path': video_path,
+        'filename': os.path.basename(video_path),
+        'duration': 0,
+        'frame_count': 0,
+        'fps': 0,
+        'width': 0,
+        'height': 0,
+        'resolution': '0x0',
+        'extraction_time': time.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
     try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            # Get video properties
+            metadata['frame_count'] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            metadata['fps'] = float(cap.get(cv2.CAP_PROP_FPS))
+            metadata['width'] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            metadata['height'] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            metadata['resolution'] = f"{metadata['width']}x{metadata['height']}"
+            
+            # Calculate duration
+            if metadata['fps'] > 0 and metadata['frame_count'] > 0:
+                metadata['duration'] = metadata['frame_count'] / metadata['fps']
+            
+            cap.release()
+    except Exception as e:
+        print(f"Error extracting metadata from {video_path}: {str(e)}")
+    
+    return metadata
+
+def process_video(video_path, model, processor, device, num_frames=16, extract_attention=False):
+    """Process a single video and extract features, logits, and attention maps."""
+    try:
+        # Get video metadata first
+        video_metadata = get_video_metadata(video_path)
+        
         # Check if it's a directory of frames or a video file
         if os.path.isdir(video_path):
             # It's a directory of frames
@@ -159,7 +223,7 @@ def process_video(video_path, model, processor, device, num_frames=16):
         # Extract features
         with torch.no_grad():
             # Get both outputs and hidden states
-            outputs = model(**inputs, output_hidden_states=True)
+            outputs = model(**inputs, output_hidden_states=True, output_attentions=extract_attention)
             
             # Extract features from the hidden states
             # For VideoMAE, we typically use the [CLS] token from the last hidden state
@@ -174,29 +238,60 @@ def process_video(video_path, model, processor, device, num_frames=16):
             
             # Get the logits for classification
             logits = outputs.logits
+            
+            # Extract attention maps if requested
+            attention_maps = None
+            if extract_attention and hasattr(outputs, 'attentions') and outputs.attentions is not None:
+                # Get attention maps from all layers
+                attention_maps = [attn.cpu().numpy() for attn in outputs.attentions]
         
-        return features.cpu().numpy(), logits.cpu().numpy()
+        # Calculate confidence metrics
+        confidence_metrics = calculate_confidence_metrics(logits.cpu().numpy()[0])
+        
+        return features.cpu().numpy()[0], logits.cpu().numpy()[0], confidence_metrics, video_metadata, attention_maps
     except Exception as e:
         print(f"Error processing video {video_path}: {str(e)}")
         import traceback
         traceback.print_exc()
-        return None, None
+        return None, None, None, None, None
 
-def process_batch(batch_video_paths, model, processor, device, num_frames=16):
+def process_batch(batch_video_paths, model, processor, device, num_frames=16, extract_attention=False):
     """Process a batch of videos and extract features."""
-    batch_features = []
-    batch_logits = []
+    results = []
     
     for video_path in batch_video_paths:
-        features, logits = process_video(video_path, model, processor, device, num_frames)
+        features, logits, confidence, metadata, attention = process_video(
+            video_path, model, processor, device, num_frames, extract_attention
+        )
         if features is not None and logits is not None:
-            batch_features.append(features)
-            batch_logits.append(logits)
+            results.append({
+                'features': features,
+                'logits': logits,
+                'confidence': confidence,
+                'metadata': metadata,
+                'attention': attention,
+                'path': video_path
+            })
     
-    if batch_features:
-        return np.vstack(batch_features), np.vstack(batch_logits)
-    else:
-        return None, None
+    return results
+
+def calculate_accuracy(predictions, labels):
+    """Calculate top-1 and top-5 accuracy."""
+    predictions = np.array(predictions)
+    labels = np.array(labels)
+    
+    # Top-1 accuracy
+    top1_correct = (predictions.argmax(axis=1) == labels).sum()
+    top1_accuracy = top1_correct / len(labels) * 100
+    
+    # Top-5 accuracy
+    top5_correct = 0
+    for i, label in enumerate(labels):
+        if label in np.argsort(predictions[i])[-5:]:
+            top5_correct += 1
+    top5_accuracy = top5_correct / len(labels) * 100
+    
+    return top1_accuracy, top5_accuracy
 
 def main():
     args = parse_args()
@@ -232,11 +327,14 @@ def main():
         print("CUDA not available. Using CPU.")
         args.device = 'cpu'
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory structure
+    base_output_dir = args.output_dir
+    for split in ['train', 'val', 'test']:
+        for subdir in ['features', 'metadata', 'attention']:
+            os.makedirs(os.path.join(base_output_dir, split, subdir), exist_ok=True)
     
     # Create a log file
-    log_file = os.path.join(args.output_dir, "extraction_log.txt")
+    log_file = os.path.join(base_output_dir, "extraction_log.txt")
     print(f"Logging to {log_file}")
     
     # Redirect stdout to both console and log file
@@ -283,20 +381,75 @@ def main():
         
         # Process each split
         splits = ['train', 'val', 'test']
-        split_mapping = {'val': 'cal'}  # Map 'val' to 'cal' in output files
         
-        metadata = {
+        global_metadata = {
             "num_classes": 400,
-            "model_name": "VideoMAE",
+            "model_name": args.model_id,
+            "model_type": "VideoMAE",
             "dataset": "Kinetics-400",
             "num_frames": args.num_frames,
             "extraction_date": time.strftime('%Y-%m-%d'),
-            "extraction_time": time.strftime('%H:%M:%S')
+            "extraction_time": time.strftime('%H:%M:%S'),
+            "feature_dim": model.config.hidden_size if hasattr(model, 'config') and hasattr(model.config, 'hidden_size') else None,
+            "preprocessing": {
+                "num_frames": args.num_frames,
+                "image_size": processor.size if hasattr(processor, 'size') else None,
+                "mean": processor.image_mean if hasattr(processor, 'image_mean') else None,
+                "std": processor.image_std if hasattr(processor, 'image_std') else None
+            }
         }
         
+        # First print the loader for all splits to check if all videos are there
+        print(f"\n{'='*50}")
+        print(f"CHECKING DATA AVAILABILITY FOR ALL SPLITS")
+        print(f"{'='*50}")
+        
         for split in splits:
-            output_split = split_mapping.get(split, split)
-            print(f"\nProcessing {split} split (saving as {output_split})...")
+            print(f"\nChecking {split} split data availability...")
+            
+            # Get balanced video files
+            try:
+                video_files, class_to_idx, class_video_counts = get_balanced_video_files(
+                    base_path=args.kinetics_dir,
+                    split=split,
+                    samples_per_class=args.samples_per_class if args.samples_per_class > 0 else None,
+                    seed=args.seed,
+                    annotations_dir=args.annotations_dir
+                )
+                
+                total_videos = len(video_files)
+                total_classes = len(class_to_idx)
+                
+                # Calculate expected videos based on samples_per_class
+                expected_videos = args.samples_per_class * total_classes if args.samples_per_class > 0 else "all available"
+                
+                print(f"Split: {split}")
+                print(f"Total classes: {total_classes}")
+                print(f"Expected videos: {expected_videos}")
+                print(f"Found videos: {total_videos}")
+                
+                if args.samples_per_class > 0:
+                    percentage = (total_videos / (args.samples_per_class * total_classes)) * 100
+                    print(f"Data availability: {percentage:.2f}% of requested videos found")
+                
+                # Count classes with full samples
+                classes_with_full_samples = sum(1 for count in class_video_counts.values() 
+                                              if count >= args.samples_per_class)
+                
+                print(f"Classes with full samples: {classes_with_full_samples}/{total_classes} "
+                      f"({classes_with_full_samples/total_classes*100:.2f}%)")
+                
+            except Exception as e:
+                print(f"Error checking {split} split: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n{'='*50}")
+        print(f"STARTING FEATURE EXTRACTION FOR ALL SPLITS")
+        print(f"{'='*50}")
+        
+        for split in splits:
+            print(f"\nProcessing {split} split...")
             
             # Get balanced video files
             try:
@@ -304,21 +457,21 @@ def main():
                     base_path=args.kinetics_dir,
                     split=split,
                     samples_per_class=args.samples_per_class if args.samples_per_class > 0 else None,
-                    seed=args.seed
+                    seed=args.seed,
+                    annotations_dir=args.annotations_dir
                 )
                 
                 print(f"Found {len(video_files)} videos for {split} split")
-                
-                # Process videos and extract features
-                all_features = []
-                all_logits = []
-                all_labels = []
                 
                 # Track statistics
                 total_videos = len(video_files)
                 successful_videos = 0
                 failed_videos = 0
                 start_time = time.time()
+                
+                # For accuracy calculation
+                all_predictions = []
+                all_labels = []
                 
                 # Process videos in batches
                 for i in tqdm(range(0, len(video_files), args.batch_size), desc=f"Processing {split} videos in batches"):
@@ -328,33 +481,45 @@ def main():
                     # Extract video paths and labels
                     batch_paths = [video_info['path'] for video_info in batch_video_info]
                     batch_labels = [video_info['label'] for video_info in batch_video_info]
+                    batch_ids = [video_info['id'] if 'id' in video_info else f"{split}_{idx}" 
+                                for idx, video_info in enumerate(batch_video_info, start=i)]
                     
                     # Process batch
-                    batch_features = []
-                    batch_logits = []
-                    valid_indices = []
+                    batch_results = process_batch(
+                        batch_paths, model, processor, device, 
+                        args.num_frames, args.extract_attention
+                    )
                     
-                    # Process each video in the batch
-                    for j, video_path in enumerate(batch_paths):
-                        try:
-                            features, logits = process_video(video_path, model, processor, device, args.num_frames)
-                            if features is not None and logits is not None:
-                                batch_features.append(features)
-                                batch_logits.append(logits)
-                                valid_indices.append(j)
-                                successful_videos += 1
-                            else:
-                                failed_videos += 1
-                                print(f"Failed to process video: {video_path}")
-                        except Exception as e:
+                    # Save results for each video
+                    for result, video_id, label in zip(batch_results, batch_ids, batch_labels):
+                        if result:
+                            # Save feature file (features, logits, label, confidence)
+                            feature_path = os.path.join(base_output_dir, split, 'features', f"video_{video_id}.npz")
+                            np.savez_compressed(
+                                feature_path,
+                                features=result['features'],
+                                logits=result['logits'],
+                                label=label,
+                                confidence=result['confidence']
+                            )
+                            
+                            # Save metadata file
+                            metadata_path = os.path.join(base_output_dir, split, 'metadata', f"video_{video_id}.json")
+                            with open(metadata_path, 'w') as f:
+                                json.dump(result['metadata'], f, indent=2)
+                            
+                            # Save attention maps if available
+                            if args.extract_attention and result['attention'] is not None:
+                                attention_path = os.path.join(base_output_dir, split, 'attention', f"video_{video_id}.npz")
+                                np.savez_compressed(attention_path, attention=result['attention'])
+                            
+                            # Store predictions and labels for accuracy calculation
+                            all_predictions.append(result['logits'])
+                            all_labels.append(label)
+                            
+                            successful_videos += 1
+                        else:
                             failed_videos += 1
-                            print(f"Exception processing video {video_path}: {str(e)}")
-                    
-                    # Add valid results to the overall lists
-                    if batch_features:
-                        all_features.extend(batch_features)
-                        all_logits.extend(batch_logits)
-                        all_labels.extend([batch_labels[j] for j in valid_indices])
                     
                     # Print batch progress
                     if (i // args.batch_size) % 5 == 0 or i + args.batch_size >= len(video_files):  # Print every 5 batches or at the end
@@ -368,51 +533,46 @@ def main():
                         print(f"Success: {successful_videos}, Failed: {failed_videos}, "
                               f"Success rate: {successful_videos/(successful_videos+failed_videos)*100:.1f}%")
                         
+                        # Calculate and print accuracy if we have processed videos
+                        if all_predictions and all_labels:
+                            top1_acc, top5_acc = calculate_accuracy(all_predictions, all_labels)
+                            print(f"Current Top-1 Accuracy: {top1_acc:.2f}%")
+                            print(f"Current Top-5 Accuracy: {top5_acc:.2f}%")
+                        
                         if torch.cuda.is_available():
                             for gpu_id in range(torch.cuda.device_count()):
                                 print(f"GPU {gpu_id} memory: "
                                       f"{torch.cuda.memory_allocated(gpu_id) / 1024**2:.1f} MB / "
                                       f"{torch.cuda.memory_reserved(gpu_id) / 1024**2:.1f} MB")
                 
-                # Save results if we have any
-                if all_features:
-                    # Convert to numpy arrays
-                    all_features = np.array(all_features, dtype=np.float32)
-                    all_logits = np.array(all_logits, dtype=np.float32)
-                    all_labels = np.array(all_labels, dtype=np.int64)
-                    
-                    # Save features, logits, and labels
-                    features_file = os.path.join(args.output_dir, f"kinetics400_{output_split}_features.npy")
-                    logits_file = os.path.join(args.output_dir, f"kinetics400_{output_split}_logits.npy")
-                    labels_file = os.path.join(args.output_dir, f"kinetics400_{output_split}_labels.npy")
-                    
-                    np.save(features_file, all_features)
-                    np.save(logits_file, all_logits)
-                    np.save(labels_file, all_labels)
-                    
-                    print(f"\nSaved {output_split} data:")
-                    print(f"  Features: {all_features.shape} -> {features_file}")
-                    print(f"  Logits: {all_logits.shape} -> {logits_file}")
-                    print(f"  Labels: {all_labels.shape} -> {labels_file}")
-                    
-                    # Update metadata
-                    metadata[f"{output_split}_samples"] = len(all_labels)
-                    metadata[f"{output_split}_success_rate"] = f"{successful_videos/(successful_videos+failed_videos)*100:.1f}%"
-                    
-                    # Set feature dimension if not already set
-                    if "feature_dim" not in metadata:
-                        metadata["feature_dim"] = all_features.shape[1]
-                else:
-                    print(f"No valid features extracted for {split} split")
+                # Calculate final accuracy for the split
+                if all_predictions and all_labels:
+                    top1_acc, top5_acc = calculate_accuracy(all_predictions, all_labels)
+                    print(f"\n{'='*50}")
+                    print(f"FINAL ACCURACY FOR {split.upper()} SPLIT")
+                    print(f"Top-1 Accuracy: {top1_acc:.2f}%")
+                    print(f"Top-5 Accuracy: {top5_acc:.2f}%")
+                    print(f"{'='*50}")
+                
+                # Update global metadata with split statistics
+                global_metadata[f"{split}_statistics"] = {
+                    "total_videos": total_videos,
+                    "successful_videos": successful_videos,
+                    "failed_videos": failed_videos,
+                    "success_rate": f"{successful_videos/(successful_videos+failed_videos)*100:.1f}%" if (successful_videos+failed_videos) > 0 else "N/A",
+                    "top1_accuracy": f"{top1_acc:.2f}%" if all_predictions and all_labels else "N/A",
+                    "top5_accuracy": f"{top5_acc:.2f}%" if all_predictions and all_labels else "N/A"
+                }
+                
             except Exception as e:
                 print(f"Error processing split {split}: {str(e)}")
                 import traceback
                 traceback.print_exc()
         
-        # Save metadata
-        metadata_file = os.path.join(args.output_dir, "metadata.json")
+        # Save global metadata
+        metadata_file = os.path.join(base_output_dir, "metadata.json")
         with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(global_metadata, f, indent=2)
         
         print(f"\nExtraction complete. Metadata saved to {metadata_file}")
         print(f"{'='*50}")

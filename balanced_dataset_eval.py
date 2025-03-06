@@ -48,15 +48,16 @@ def parse_args():
     
     return parser.parse_args()
 
-def get_balanced_video_files(base_path: str, split: str, samples_per_class: int, seed: int = 42) -> Tuple[List[Dict], Dict, Dict]:
+def get_balanced_video_files(base_path: str, split: str, samples_per_class: Optional[int] = None, seed: int = 42, annotations_dir: Optional[str] = None) -> Tuple[List[Dict], Dict, Dict]:
     """
     Get a balanced subset of video files with labels from the specified split.
     
     Args:
         base_path (str): Base path to the Kinetics-400 dataset
         split (str): Dataset split ('train', 'val', or 'test')
-        samples_per_class (int): Number of samples per class
+        samples_per_class (Optional[int]): Number of samples per class. If None, use all available samples.
         seed (int): Random seed for reproducibility
+        annotations_dir (Optional[str]): Custom directory for annotation files. If None, use default location.
         
     Returns:
         Tuple[List[Dict], Dict, Dict]: Video files with labels, class to index mapping, and video counts per class
@@ -67,10 +68,16 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
     
     # Paths for annotations and videos
     base_path = Path(base_path)
-    annotation_path = base_path / 'annotations' / f'{split}.csv'
     video_path = base_path / split
     
-    print(f"Loading annotations from {annotation_path}")
+    # Determine annotation path
+    if annotations_dir:
+        annotation_path = Path(annotations_dir) / f'{split}.csv'
+        print(f"Using custom annotation file from: {annotation_path}")
+    else:
+        annotation_path = base_path / 'annotations' / f'{split}.csv'
+        print(f"Using default annotation file from: {annotation_path}")
+    
     if not annotation_path.exists():
         raise FileNotFoundError(f"Annotation file not found: {annotation_path}")
     
@@ -87,7 +94,7 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
         class_samples = df[df['label'] == class_name]
         
         # Skip if not enough samples
-        if len(class_samples) < samples_per_class:
+        if samples_per_class is not None and len(class_samples) < samples_per_class:
             if len(class_samples) < 1:  # Skip classes with no samples
                 print(f"Skipping class {class_name} with no samples")
                 skipped_classes += 1
@@ -96,7 +103,11 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
             print(f"Warning: Class {class_name} has only {len(class_samples)} samples (< {samples_per_class})")
             selected = class_samples
         else:
-            selected = class_samples.sample(n=samples_per_class, random_state=seed)
+            if samples_per_class is not None:
+                selected = class_samples.sample(n=samples_per_class, random_state=seed)
+            else:
+                # Use all samples if samples_per_class is None
+                selected = class_samples
         
         subset_data.append(selected)
         valid_classes += 1
@@ -134,7 +145,7 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
     print(f"Found {len(all_video_files)} unique video IDs in directory")
     
     # Process each annotation
-    for _, row in tqdm(subset_df.iterrows(), desc="Preparing video files", total=len(subset_df)):
+    for idx, row in tqdm(subset_df.iterrows(), desc="Preparing video files", total=len(subset_df)):
         youtube_id = row['youtube_id']
         time_start = row['time_start']
         time_end = row['time_end']
@@ -149,7 +160,8 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
             video_files.append({
                 'path': str(video_file),
                 'label': class_to_idx[class_name],
-                'class_name': class_name
+                'class_name': class_name,
+                'id': f"{youtube_id}_{time_start:06d}_{time_end:06d}"
             })
             existing_videos += 1
             class_video_counts[class_name] += 1
@@ -163,7 +175,8 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
             video_files.append({
                 'path': str(video_file),
                 'label': class_to_idx[class_name],
-                'class_name': class_name
+                'class_name': class_name,
+                'id': f"{youtube_id}_{time_start:06d}_{time_end:06d}"
             })
             existing_videos += 1
             class_video_counts[class_name] += 1
@@ -182,7 +195,8 @@ def get_balanced_video_files(base_path: str, split: str, samples_per_class: int,
                 video_files.append({
                     'path': str(video_file),
                     'label': class_to_idx[class_name],
-                    'class_name': class_name
+                    'class_name': class_name,
+                    'id': f"{youtube_id}_{time_start:06d}_{time_end:06d}"
                 })
                 existing_videos += 1
                 class_video_counts[class_name] += 1
