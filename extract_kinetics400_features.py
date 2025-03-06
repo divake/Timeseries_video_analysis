@@ -28,13 +28,13 @@ def parse_args():
                         help='Number of samples per class for balanced sampling (-1 for all)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
-    parser.add_argument('--device', type=str, default='cuda:0',
+    parser.add_argument('--device', type=str, default='cuda:1',
                         help='Device to use for extraction')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for feature extraction')
     parser.add_argument('--num_frames', type=int, default=16,
                         help='Number of frames to sample from each video')
-    parser.add_argument('--gpu', type=str, default='all',
+    parser.add_argument('--gpu', type=str, default='1',
                         help="GPU selection: 'all' for all GPUs, '0' for GPU 0 only, '1' for GPU 1 only, '0,1' for both GPUs")
     parser.add_argument('--no_multi_gpu', action='store_true',
                         help='Disable multi-GPU even if multiple are available')
@@ -215,7 +215,8 @@ def main():
             args.device = 'cuda'
             use_multi_gpu = not args.no_multi_gpu
         else:
-            args.device = 'cuda:0'  # With CUDA_VISIBLE_DEVICES set, this will be the selected GPU
+            # Keep the user-specified device instead of overriding it
+            # This allows using cuda:1 even when CUDA_VISIBLE_DEVICES is set
             use_multi_gpu = False
     else:
         use_multi_gpu = not args.no_multi_gpu
